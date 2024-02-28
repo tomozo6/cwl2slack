@@ -1,0 +1,103 @@
+name: Build and Push and Deploy dev
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'application/**'
+      - 'envs/dev.env'
+
+env:
+  PRODUCT: datahub
+  ENV: dev
+  SERVICE: contract-api
+  AWS_ACCOUNT_ID: 804977255027
+  ECR_REPOSITORY: contract-api
+  CONTAINER_NAME: contract-api
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.PRODUCT }}-${{ env.ENV }}-${{ env.SERVICE }}-github-actions-role
+          aws-region: ap-northeast-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          provenance: false
+          push: true
+          file: docker/node/Dockerfile
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          build-args: NPM_TOKEN=${{ secrets.NPM_TOKEN }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.PRODUCT }}-${{ env.ENV }}-${{ env.SERVICE }}-github-actions-role
+          aws-region: ap-northeast-1
+
+      - name: Upload env file to S3
+        env:
+          S3_UPLOAD_BUCKET: ${{ env.PRODUCT }}-${{ env.ENV }}-ecsenvs-s3
+          SRC_ENV_FILE: ${{ env.ENV }}.env
+          DST_ENV_FILE: ${{ env.SERVICE }}.env
+        run: |
+          aws s3 cp ./envs/$SRC_ENV_FILE s3://$S3_UPLOAD_BUCKET/$DST_ENV_FILE
+
+      - name: Add envTag to ECR image
+        continue-on-error: true
+        run: |
+          MANIFEST=$(aws ecr batch-get-image --repository-name ${{ env.ECR_REPOSITORY }} --image-ids imageTag=${{ github.sha }} --query images[].imageManifest --output text)
+          aws ecr put-image --repository-name ${{ env.ECR_REPOSITORY }} --image-tag ${{ env.ENV }} --image-manifest "$MANIFEST"
+
+      - name: ECS service Rolling Update
+        env:
+          ECS_CLUSTER: ${{ env.PRODUCT }}-${{ env.ENV }}-main-ecs-cluster
+          ECS_SERVICE: ${{ env.PRODUCT }}-${{ env.ENV }}-${{ env.SERVICE }}-ecs-service
+        run: |
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment

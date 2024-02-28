@@ -1,0 +1,15 @@
+version: "3.8"
+services:
+  cwl2slack:
+    build: .
+    environment:
+     # 設定必須項目
+     - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+     - SLACK_CHANNEL=${SLACK_CHANNEL}
+
+     # 設定任意項目(デフォルト値あり)
+     #- RE_EXCLUDE_WORD=${RE_EXCLUDE_WORD}
+     #- FUNCTION_NAME=${FUNCTION_NAME}
+
+    ports:
+      - 9000:8080
